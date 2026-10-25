@@ -2,6 +2,7 @@
 
 import asyncio
 import shutil
+import signal
 import subprocess
 import sys
 import uuid
@@ -78,6 +79,8 @@ class FasterWhisperSTT(STTBase):
                 audio_data, sample_rate = sf.read(audio, dtype="float32")
                 if audio_data.ndim > 1:
                     audio_data = audio_data.mean(axis=1)
+                if audio_data.size == 0:
+                    return None
                 if sample_rate != SAMPLE_RATE:
                     duration = audio_data.shape[0] / sample_rate
                     target = int(duration * SAMPLE_RATE)
@@ -96,7 +99,11 @@ class FasterWhisperSTT(STTBase):
 
                 import soundfile as sf
 
-                audio_data, _ = sf.read(io.BytesIO(audio))
+                audio_data, _ = sf.read(io.BytesIO(audio), dtype="float32")
+                if audio_data.ndim > 1:
+                    audio_data = audio_data.mean(axis=1)
+                if audio_data.size == 0:
+                    return None
                 segments, _ = self.model.transcribe(
                     audio_data,
                     language=self.settings.stt_language,
@@ -182,13 +189,29 @@ class FasterWhisperSTT(STTBase):
             else:
                 await asyncio.sleep(duration)
         finally:
-            process.terminate()
-            try:
-                await asyncio.to_thread(process.wait, 5)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                await asyncio.to_thread(process.wait)
+            # SIGINT lets arecord finish the WAV header before exiting.
+            # SIGTERM/SIGKILL leaves an unreadable file.
+            if process.poll() is None:
+                try:
+                    process.send_signal(signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.to_thread(process.wait, 5)
+                except subprocess.TimeoutExpired:
+                    process.terminate()
+                    try:
+                        await asyncio.to_thread(process.wait, 2)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        await asyncio.to_thread(process.wait)
 
+        # A missing or header-only WAV means nothing was captured.
+        try:
+            if not wav_path.exists() or wav_path.stat().st_size <= 44:
+                return None
+        except OSError:
+            return None
         return str(wav_path)
 
     async def listen(
@@ -212,6 +235,8 @@ class FasterWhisperSTT(STTBase):
         use_arecord = shutil.which("arecord") is not None
         if use_arecord:
             wav_path = await self._record_arecord(duration)
+            if not wav_path:
+                return None
             try:
                 return await self.transcribe(wav_path)
             finally:

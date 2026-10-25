@@ -24,8 +24,8 @@ class Settings(BaseSettings):
     
     # STT settings
     stt_enabled: bool = True
-    stt_model: str = "tiny.en"  # whisper model size or path
-    stt_engine: str = "faster-whisper"  # faster-whisper, whisper, vosk
+    stt_model: str = "tiny.en"  # faster-whisper model size or path
+    stt_engine: str = "faster-whisper"
     stt_device: str = "cpu"
     stt_language: str = "en"
     stt_audio_device: str = "hw:1,0"  # ALSA device used by arecord on CoralBoard
@@ -57,8 +57,26 @@ class Settings(BaseSettings):
     # Tools/Integrations
     enable_phone_tools: bool = True
     enable_maps_tools: bool = True
+    enable_weather_tools: bool = True
     google_voice_enabled: bool = False
     google_maps_api_key: Optional[str] = None
+
+    # Weather (Open-Meteo, no API key)
+    weather_location: Optional[str] = None
+    weather_units: str = "fahrenheit"
+
+    # Navigation / maps
+    current_location: Optional[str] = None
+    navigation_units: str = "miles"
+    navigation_command: Optional[str] = None
+
+    # Phone/text provider. When unset, calls and texts are logged to
+    # ~/.sayless/phone.log and reported as simulated.
+    phone_call_command: Optional[str] = None
+    phone_text_command: Optional[str] = None
+
+    # Seed demo contacts when the address book is empty.
+    seed_contacts: bool = True
     
     # MCP
     mcp_config_path: Path = Field(default_factory=lambda: Path.home() / ".sayless" / "mcp.json")

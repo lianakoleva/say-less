@@ -5,12 +5,13 @@ CoralBoard CPU. Start it with:
 
     python -m sayless.llm.server
 
-The ``mobile_actions`` LiteRT-LM model does not use native OpenAI tool calling.
-Instead the tools are described in the prompt and the model replies with:
+FunctionGemma models (such as ``mobile_actions_q8_ekv1024.litertlm``) receive
+their tool declarations through LiteRT-LM and reply with native
+``<start_function_call>`` tokens, which the server turns into OpenAI-style
+``tool_calls``. Older chat models without function-calling support fall back to
+a JSON prompt:
 
     {"function_call": {"name": "...", "arguments": {...}}}
-
-This module builds that prompt and parses the reply.
 """
 
 import json
@@ -20,9 +21,10 @@ from typing import Optional, Dict, Any, List, Union
 import httpx
 
 from ..base import LLMBase
+from ..function_call import parse_call
+from ...tools.model_tools import DEVELOPER_INSTRUCTION
 
-
-FUNCTION_CALL_INSTRUCTIONS = """You are a local voice assistant with access to tools.
+JSON_FUNCTION_CALL_INSTRUCTIONS = """You are a local voice assistant with access to tools.
 When the user requests an action, respond with ONLY a JSON object in this exact format:
 {"function_call": {"name": "function_name", "arguments": {"arg_name": "arg_value"}}}
 
@@ -31,8 +33,10 @@ Rules:
 - Use a function from the available list and fill its arguments.
 - If no function is needed, reply normally in plain English."""
 
-_FENCED_JSON = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
-_JSON_OBJECT = re.compile(r"\{.*\}", re.S)
+_SPECIAL_TOKENS = re.compile(
+    r"<end_of_turn>|<start_of_turn>|<eos>|<bos>|<end_function_call>|"
+    r"<start_function_call>|<start_function_response>|<end_function_response>"
+)
 
 
 class LiteRTLMLLM(LLMBase):
@@ -43,6 +47,9 @@ class LiteRTLMLLM(LLMBase):
         self.client: Optional[httpx.AsyncClient] = None
         self.model = self.config.get("model") or self.settings.llm_model_name
         self.error: Optional[str] = None
+        # None means the server did not report a capability; assume native
+        # function calling since FunctionGemma is the target model.
+        self.supports_tools: Optional[bool] = None
 
     @property
     def base_url(self) -> str:
@@ -55,10 +62,18 @@ class LiteRTLMLLM(LLMBase):
 
         try:
             response = await self.client.get("/models")
-            if response.status_code == 404:
+            if response.status_code == 200:
+                data = response.json()
+                if isinstance(data, dict) and "supports_tools" in data:
+                    self.supports_tools = bool(data["supports_tools"])
+            else:
                 # Some server builds only expose /health at the root.
                 root = self.base_url[:-3] if self.base_url.endswith("/v1") else self.base_url
                 response = await self.client.get(f"{root}/health")
+                if response.status_code == 200:
+                    data = response.json()
+                    if isinstance(data, dict) and "supports_tools" in data:
+                        self.supports_tools = bool(data["supports_tools"])
             response.raise_for_status()
         except Exception:
             self.error = (
@@ -109,10 +124,17 @@ class LiteRTLMLLM(LLMBase):
         message = await self._complete(messages, **kwargs)
         if message is None:
             return None
-        return message.get("content") or ""
+        return self._clean(message.get("content") or "")
 
     async def generate(self, prompt: str, **kwargs) -> Optional[str]:
         return await self.chat([{"role": "user", "content": prompt}], **kwargs)
+
+    @staticmethod
+    def _clean(text: str) -> str:
+        """Drop chat-template special tokens from model text."""
+        return _SPECIAL_TOKENS.sub("", str(text)).strip()
+
+    # ── JSON fallback for models without native function calling ────────────
 
     @staticmethod
     def _describe_tools(tools: List[Dict[str, Any]]) -> str:
@@ -153,7 +175,7 @@ class LiteRTLMLLM(LLMBase):
     @classmethod
     def _tool_prompt(cls, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]) -> str:
         return (
-            f"{FUNCTION_CALL_INSTRUCTIONS}\n\n"
+            f"{JSON_FUNCTION_CALL_INSTRUCTIONS}\n\n"
             f"Available functions:\n{cls._describe_tools(tools)}\n\n"
             f"User request: {cls._last_user_text(messages)}\n\n"
             "Respond now."
@@ -161,51 +183,25 @@ class LiteRTLMLLM(LLMBase):
 
     @staticmethod
     def _parse_function_call(text: str) -> Optional[tuple[str, Dict[str, Any]]]:
-        """Parse the model's JSON function call, if any."""
-        candidates = [text.strip()]
-        candidates.extend(match.strip() for match in _FENCED_JSON.findall(text))
-        match = _JSON_OBJECT.search(text)
-        if match:
-            candidates.append(match.group(0))
+        """Parse a native marker block or a JSON ``function_call``."""
+        return parse_call(text)
 
-        for candidate in candidates:
-            if not candidate:
-                continue
-            try:
-                data = json.loads(candidate)
-            except (json.JSONDecodeError, TypeError):
-                continue
-            if not isinstance(data, dict):
-                continue
+    @staticmethod
+    def _valid_names(tools: List[Dict[str, Any]]) -> set:
+        names = set()
+        for tool in tools:
+            function = tool.get("function", tool)
+            if isinstance(function, dict) and function.get("name"):
+                names.add(function["name"])
+        return names
 
-            call = data.get("function_call", data)
-            if not isinstance(call, dict):
-                continue
-            name = call.get("name")
-            if not name:
-                continue
-            arguments = call.get("arguments", {})
-            if isinstance(arguments, str):
-                try:
-                    arguments = json.loads(arguments)
-                except json.JSONDecodeError:
-                    arguments = {}
-            if not isinstance(arguments, dict):
-                arguments = {}
-            return str(name), arguments
-
-        return None
-
-    async def generate_with_tools(
+    async def _json_tool_call(
         self,
-        prompt: Union[str, List[Dict[str, Any]]],
+        messages: List[Dict[str, Any]],
         tools: List[Dict[str, Any]],
         **kwargs,
     ) -> Optional[Dict[str, Any]]:
-        """Generate a reply and parse the model's JSON ``function_call``."""
-        messages = prompt if isinstance(prompt, list) else [
-            {"role": "user", "content": str(prompt)}
-        ]
+        """Prompt-driven JSON calls for chat models without tool support."""
         tool_prompt = self._tool_prompt(messages, tools)
         message = await self._complete(
             [{"role": "user", "content": tool_prompt}], **kwargs
@@ -213,21 +209,15 @@ class LiteRTLMLLM(LLMBase):
         if message is None:
             return None
 
-        text = (message.get("content") or "").strip()
-        call = self._parse_function_call(text)
-
-        valid_names = {
-            tool.get("function", tool).get("name")
-            for tool in tools
-            if isinstance(tool.get("function", tool), dict)
-        }
-        if call is None or call[0] not in valid_names:
+        text = self._clean(message.get("content") or "")
+        call = parse_call(text)
+        if call is None or call[0] not in self._valid_names(tools):
             # The model sometimes answers non-tool questions with JSON anyway.
             # Retry without the tool prompt so the user gets a normal reply.
             if "function_call" in text or text.lstrip().startswith("{"):
                 plain = await self.chat(messages, **kwargs)
-                if plain and plain.strip():
-                    text = plain.strip()
+                if plain:
+                    text = plain
             return {"response": text, "tool_calls": []}
 
         name, arguments = call
@@ -244,3 +234,72 @@ class LiteRTLMLLM(LLMBase):
                 }
             ],
         }
+
+    @staticmethod
+    def _looks_like_tool_refusal(text: str) -> bool:
+        """FunctionGemma refuses when it sees no tool declarations."""
+        lower = text.lower()
+        return (
+            "i am functiongemma" in lower
+            or ("only assist" in lower and "function call" in lower)
+            or ("i can only" in lower and "function" in lower)
+        )
+
+    async def generate_with_tools(
+        self,
+        prompt: Union[str, List[Dict[str, Any]]],
+        tools: List[Dict[str, Any]],
+        **kwargs,
+    ) -> Optional[Dict[str, Any]]:
+        """Generate a reply and return any requested tool calls."""
+        messages = prompt if isinstance(prompt, list) else [
+            {"role": "user", "content": str(prompt)}
+        ]
+
+        # FunctionGemma refuses action requests unless the developer
+        # instruction is present. Callers normally don't set a system message.
+        if not any(m.get("role") == "system" for m in messages):
+            messages = [
+                {"role": "system", "content": DEVELOPER_INSTRUCTION},
+                *messages,
+            ]
+
+        # Native path: LiteRT-LM renders the FunctionGemma developer block from
+        # the tool schemas and parses the model's call markers for us.
+        message = await self._complete(messages, tools=tools, **kwargs)
+        if message is None:
+            return None
+
+        text = self._clean(message.get("content") or "")
+        tool_calls = message.get("tool_calls") or []
+        if tool_calls:
+            return {"response": "", "tool_calls": tool_calls}
+
+        # Some LiteRT-LM builds return the raw call tokens as content. Parse
+        # before stripping special tokens so the markers are still present.
+        call = parse_call(message.get("content") or "")
+        if call is not None and call[0] in self._valid_names(tools):
+            name, arguments = call
+            return {
+                "response": "",
+                "tool_calls": [
+                    {
+                        "id": "call_0",
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(arguments),
+                        },
+                    }
+                ],
+            }
+
+        # A model without native function calling either answers normally or
+        # ignores the schemas. Fall back to the JSON prompt when the reply is
+        # empty or FunctionGemma's "no functions declared" refusal.
+        if not text or self._looks_like_tool_refusal(text):
+            fallback = await self._json_tool_call(messages, tools, **kwargs)
+            if fallback and (fallback.get("tool_calls") or fallback.get("response")):
+                return fallback
+
+        return {"response": text, "tool_calls": []}

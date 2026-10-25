@@ -22,6 +22,7 @@ from .queue import QueueManager
 from .data.contacts import ContactsManager
 from .data.notes import NotesManager
 from .data.chat import ChatManager
+from .tools import model_tools
 
 console = Console()
 
@@ -51,6 +52,28 @@ def _llm_server_up(base_url: str) -> bool:
         return response.status_code == 200
     except Exception:
         return False
+
+
+def _server_health(base_url: str) -> dict:
+    """Return the server's /health payload, or an empty dict."""
+    try:
+        response = httpx.get(f"{_server_root(base_url)}/health", timeout=2.0)
+        if response.status_code == 200:
+            data = response.json()
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _show_log_tail(log_path: Path, lines: int = 30) -> None:
+    """Print the end of the LLM server log, if it exists."""
+    try:
+        text = log_path.read_text(errors="replace").splitlines()[-lines:]
+    except Exception:
+        return
+    if text:
+        console.print("\n".join(text), markup=False, style="dim")
 
 
 def _start_llm_server() -> bool:
@@ -83,19 +106,31 @@ def _start_llm_server() -> bool:
         str(settings.llm_server_port),
     ]
     with open(log_path, "ab", buffering=0) as log:
-        subprocess.Popen(
+        process = subprocess.Popen(
             command,
             stdout=log,
             stderr=log,
             start_new_session=True,
         )
 
-    for _ in range(120):
+    console.print(
+        f"[dim]Loading the model (first run can take a minute). "
+        f"Log: {log_path}[/dim]"
+    )
+
+    deadline = time.time() + 300
+    while time.time() < deadline:
         if _llm_server_up(settings.llm_base_url):
             return True
+        if process.poll() is not None:
+            console.print("[red]LiteRT-LM server exited during startup.[/red]")
+            _show_log_tail(log_path)
+            return False
         time.sleep(0.5)
 
+    console.print("[red]LiteRT-LM server did not respond within 5 minutes.[/red]")
     console.print(f"[dim]Server log: {log_path}[/dim]")
+    _show_log_tail(log_path)
     return False
 
 
@@ -223,6 +258,15 @@ def doctor():
     add("LLM model file", model_path.is_file(), str(model_path))
     server_up = _llm_server_up(settings.llm_base_url)
     add("LiteRT-LM server", server_up, settings.llm_base_url)
+    if server_up:
+        health = _server_health(settings.llm_base_url)
+        if "supports_tools" in health:
+            native = bool(health["supports_tools"])
+            add(
+                "Function calling",
+                True,
+                "native FunctionGemma tools" if native else "native first, JSON fallback",
+            )
 
     for module, label in [
         ("faster_whisper", "faster-whisper"),
@@ -236,11 +280,27 @@ def doctor():
     add("arecord (CoralBoard mic)", arecord is not None,
         "" if arecord else "alsa-utils")
     add("STT model", True, settings.stt_model)
+    if settings.google_maps_api_key:
+        table.add_row(
+            "Google Maps key",
+            "[green]SET[/green] [dim]requires the legacy Directions API[/dim]",
+        )
+    else:
+        table.add_row(
+            "Google Maps key",
+            "[yellow]NOT SET[/yellow] [dim]using free OSRM routing[/dim]",
+        )
     add("Queue directory", settings.queue_dir.exists(), str(settings.queue_dir))
     console.print(table)
 
     if not (server_up and model_path.is_file()):
         console.print("\n[cyan]Run 'sayless setup' to start the LiteRT-LM server.[/cyan]")
+
+
+@main.command()
+def tools():
+    """Show what SayLess can do in plain language."""
+    console.print(model_tools.help_text())
 
 
 @main.command()
@@ -377,11 +437,40 @@ def config():
     table.add_row("LLM Model Path", str(settings.llm_model_path))
     table.add_row("LLM Base URL", settings.llm_base_url)
     table.add_row("Phone Tools", str(settings.enable_phone_tools))
+    table.add_row("Phone Provider", "command" if (settings.phone_call_command or settings.phone_text_command) else "simulated log")
     table.add_row("Maps Tools", str(settings.enable_maps_tools))
+    table.add_row("Navigation Provider", "Google Directions (OSRM fallback)" if settings.google_maps_api_key else "OSRM (free fallback)")
+    table.add_row("Google Maps Key", "set" if settings.google_maps_api_key else "not set")
+    table.add_row("Current Location", settings.current_location or "ask each route")
+    table.add_row("Navigation Units", settings.navigation_units)
+    table.add_row("Weather Tools", str(settings.enable_weather_tools))
+    table.add_row("Weather Location", settings.weather_location or "ask on first use")
+    table.add_row("Seed Contacts", str(settings.seed_contacts))
     table.add_row("Queue Enabled", str(settings.queue_enabled))
     
     console.print(table)
     console.print(f"\n[dim]Config file: .env (or env vars with SAYLESS_ prefix)[/dim]")
+
+
+@main.command()
+def profile():
+    """Show notes SayLess has saved about you."""
+    async def _profile():
+        from .data.profile import UserProfile
+
+        data = await UserProfile().get_all()
+        if not data:
+            console.print("[yellow]No saved preferences yet[/yellow]")
+            return
+        table = Table(title="User Profile")
+        table.add_column("Key", style="cyan")
+        table.add_column("Value", style="green")
+        for key, value in sorted(data.items()):
+            table.add_row(str(key), str(value))
+        console.print(table)
+        console.print(f"[dim]{get_settings().data_dir / 'profile'}[/dim]")
+
+    asyncio.run(_profile())
 
 
 @main.command()
@@ -481,7 +570,10 @@ def contacts_add(name, phone, email):
 def contacts_list():
     """List all contacts."""
     async def _list():
+        settings = get_settings()
         cm = ContactsManager()
+        if settings.seed_contacts:
+            await cm.seed_demo_contacts()
         contacts_list = await cm.list_contacts()
         if not contacts_list:
             console.print("[yellow]No contacts[/yellow]")
@@ -495,6 +587,20 @@ def contacts_list():
         console.print(table)
     
     asyncio.run(_list())
+
+
+@contacts.command(name='seed')
+def contacts_seed():
+    """Add any missing demo contacts."""
+    async def _seed():
+        cm = ContactsManager()
+        added = await cm.seed_demo_contacts()
+        if added:
+            console.print(f"[green]Seeded {added} demo contacts[/green]")
+        else:
+            console.print("[yellow]All demo contacts already exist[/yellow]")
+
+    asyncio.run(_seed())
 
 
 @contacts.command(name='search')

@@ -62,17 +62,26 @@ class ContactsTool(ToolBase):
                 name = params.get("name")
                 if not name:
                     return {"success": False, "error": "Name required"}
+                phone = params.get("phone")
+                email = params.get("email")
+                existing = await self.contacts.find_contact(name)
                 contact_id = await self.contacts.add_contact(
                     name=name,
-                    phone=params.get("phone"),
-                    email=params.get("email")
+                    phone=phone,
+                    email=email
                 )
-                return {"success": True, "contact_id": contact_id}
+                contact = await self.contacts.get_contact(contact_id)
+                return {
+                    "success": True,
+                    "contact_id": contact_id,
+                    "contact": contact,
+                    "updated": existing is not None,
+                }
             elif action == "get":
                 name = params.get("name")
                 contact_id = params.get("contact_id")
                 if name:
-                    contact = await self.contacts.get_contact_by_name(name)
+                    contact = await self.contacts.find_contact(name)
                 elif contact_id:
                     contact = await self.contacts.get_contact(contact_id)
                 else:

@@ -17,31 +17,25 @@ class STTManager:
         """Initialize STT engine."""
         engine_type = engine_type or self.settings.stt_engine
         
-        if engine_type == "faster-whisper":
+        if engine_type in ("faster-whisper", "faster_whisper"):
             try:
                 from .engines.faster_whisper import FasterWhisperSTT
                 self._engine = FasterWhisperSTT()
-            except ImportError:
-                print("faster-whisper not installed, falling back to dummy")
-                from .engines.dummy import DummySTT
-                self._engine = DummySTT()
-        elif engine_type == "whisper":
-            try:
-                from .engines.whisper import WhisperSTT
-                self._engine = WhisperSTT()
-            except ImportError:
-                from .engines.dummy import DummySTT
-                self._engine = DummySTT()
-        elif engine_type == "vosk":
-            try:
-                from .engines.vosk import VoskSTT
-                self._engine = VoskSTT()
-            except ImportError:
-                from .engines.dummy import DummySTT
-                self._engine = DummySTT()
-        else:
+            except ImportError as exc:
+                print(
+                    f"faster-whisper is not installed ({exc}). "
+                    "Run: pip install 'sayless[stt]'"
+                )
+                return False
+        elif engine_type == "dummy":
             from .engines.dummy import DummySTT
             self._engine = DummySTT()
+        else:
+            print(
+                f"Unknown STT engine '{engine_type}'. "
+                "Only 'faster-whisper' is supported."
+            )
+            return False
         
         if not self._engine.enabled:
             return False

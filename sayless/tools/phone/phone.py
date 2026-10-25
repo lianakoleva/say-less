@@ -1,6 +1,7 @@
 """Phone app integration."""
 from typing import Dict, Any
 from ..base import ToolBase
+from .actions import run_phone_action
 
 
 class PhoneTool(ToolBase):
@@ -11,7 +12,8 @@ class PhoneTool(ToolBase):
         self.name = "phone"
 
     def requires_internet(self) -> bool:
-        return True
+        # Calls are handled by a local command or the local log.
+        return False
 
     def get_schema(self) -> Dict[str, Any]:
         return {
@@ -47,7 +49,7 @@ class PhoneTool(ToolBase):
                 number = params.get("number") or params.get("contact")
                 if not number:
                     return {"success": False, "error": "Number or contact required"}
-                return {"success": False, "error": "Phone app integration not configured"}
+                return await run_phone_action("call", number)
             return {"success": False, "error": f"Unknown action: {action}"}
         except Exception as e:
             return {"success": False, "error": str(e)}

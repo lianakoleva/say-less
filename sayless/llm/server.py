@@ -71,6 +71,17 @@ def _message_text(message: Any) -> str:
     return ""
 
 
+def _model_supports_tools(model_path: Path) -> bool:
+    """Return True when the model advertises function-calling support."""
+    try:
+        with litert_lm.ModelInfo(str(model_path)) as info:
+            if not info.is_llm_model or not info.llm:
+                return False
+            return bool(info.llm.supports_function_calling())
+    except Exception:
+        return False
+
+
 class _SchemaTool(litert_lm.Tool):
     """A tool schema with no implementation.
 
@@ -80,12 +91,11 @@ class _SchemaTool(litert_lm.Tool):
     """
 
     def __init__(self, spec: dict[str, Any]) -> None:
-        self.spec = spec
+        function = spec.get("function", spec)
+        self.description = {"type": "function", "function": function}
 
     def get_tool_description(self) -> dict[str, Any]:
-        if "function" in self.spec:
-            return self.spec
-        return {"type": "function", "function": self.spec}
+        return self.description
 
     def execute(self, param: dict[str, Any]) -> str:
         return "Tool execution is handled by the SayLess client."
@@ -140,8 +150,13 @@ class LiteRTEngine:
         self.engine = litert_lm.Engine(str(model_path), backend=backend)
         self.model_path = model_path
         self.model_name = model_path.name
+        self.supports_tools = _model_supports_tools(model_path)
         self.lock = threading.Lock()
-        print("LiteRT-LM engine ready.", flush=True)
+        print(
+            f"LiteRT-LM engine ready (function calling: "
+            f"{'yes' if self.supports_tools else 'no'}).",
+            flush=True,
+        )
 
     def _history(
         self, messages: list[dict[str, Any]]
@@ -263,7 +278,11 @@ class Handler(BaseHTTPRequestHandler):
         if path in ("/health", "/healthz"):
             self._send(
                 200,
-                {"status": "ok", "model": self.engine.model_name},
+                {
+                    "status": "ok",
+                    "model": self.engine.model_name,
+                    "supports_tools": self.engine.supports_tools,
+                },
             )
             return
         if path in ("/v1/models", "/models"):
@@ -271,6 +290,7 @@ class Handler(BaseHTTPRequestHandler):
                 200,
                 {
                     "object": "list",
+                    "supports_tools": self.engine.supports_tools,
                     "data": [
                         {
                             "id": self.engine.model_name,
